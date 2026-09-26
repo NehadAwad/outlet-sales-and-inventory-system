@@ -1,53 +1,47 @@
 # Architecture
 
-How the POS API is laid out and how checkout stays correct under concurrent requests.
+This page explains how the backend is structured and how sales stay correct when several happen at once.
 
-## Layers
+## Structure
 
-Traffic hits Express routers under `backend/src/modules/`:
+The API is one Express app. Each feature lives in its own folder under `backend/src/modules/` (outlets, menu-items, outlet-menu, inventory, sales, reports), and every folder follows the same pattern:
 
-```text
-routes -> controllers -> services -> repositories -> TypeORM / PostgreSQL
-            ^
-      validate.middleware (Zod)
-```
+- **routes**: defines the URLs and runs Zod validation on the params, body and query.
+- **controller**: reads the validated input, calls the service and sends the response.
+- **service**: holds the business rules, such as checking stock or allocating a receipt number.
+- **repository**: runs the database queries through TypeORM.
 
-| Layer | Role |
-|-------|------|
-| Routes | HTTP paths; attach Zod schemas via `validate(...)`. |
-| Controllers | Call services; return JSON via `ApiResponse`. |
-| Services | Business rules and transactions. |
-| Repositories | TypeORM queries per aggregate. |
+A few shared pieces sit around this. `asyncHandler` passes errors from async handlers to Express. `error.middleware.ts` turns errors into JSON responses, and `notFound.middleware.ts` handles unknown URLs.
 
-Shared middleware: `error.middleware.ts`, `notFound.middleware.ts`, `asyncHandler`.
+The frontend is a React app. It calls the API through `frontend/src/api/client.ts`, which reads the API address from `VITE_API_BASE_URL`.
 
-The React SPA calls the API through `frontend/src/api/client.ts` using `VITE_API_BASE_URL`.
+## Creating a sale
 
-## Sales transaction
+Creating a sale changes several tables at once. It reserves a receipt number, reduces stock, and saves the sale with its line items. Either all of that happens or none of it does.
 
-`createSale` in `sale.service.ts` uses a TypeORM `QueryRunner`:
+`createSale` in `sale.service.ts` does this with a single TypeORM transaction:
 
-1. `connect()` and `startTransaction()`.
-2. All reads/writes for that checkout use `queryRunner.manager`.
-3. `commitTransaction()` on success; `rollbackTransaction()` on error; `release()` in `finally`.
+1. Open a transaction and check the outlet exists and is active.
+2. Load the outlet's receipt counter and lock it.
+3. Check that every item is assigned to the outlet and appears only once in the sale.
+4. Load the stock rows for those items and lock them.
+5. Check there is enough stock, then reduce it.
+6. Save the sale and its items, and bump the receipt counter.
+7. Commit. If anything fails along the way, roll everything back.
 
-## Concurrency
+## Handling sales that happen at the same time
 
-Risks at the same outlet: duplicate receipt numbers and overselling stock.
+Two things could go wrong when two sales hit the same outlet together:
 
-Mitigations in `createSale`:
+- Both read the same receipt counter and end up with the same receipt number.
+- Both see enough stock for the last few items and sell more than exists.
 
-- `ReceiptSequence` loaded with `pessimistic_write`. Unique `(outletId, receiptNumber)` on `sales` is a backstop.
-- `Inventory` rows for line items locked with `pessimistic_write` before stock checks and decrements. `stockQty >= 0` is enforced in the database.
+Locking prevents both. The receipt counter row is locked with `pessimistic_write`, so the second sale waits until the first one commits and then sees the new number. The stock rows are locked the same way before they are checked and reduced.
+
+The database also acts as a backstop. Receipt numbers are unique per outlet, and stock has a check constraint so it can't go below zero.
 
 ## Errors
 
-- Validation: HTTP 400 with Zod issues.
-- `ApiError`: mapped status (404, 409, etc.).
-- Unexpected errors: logged; generic 500 response.
-
-## Related
-
-- [erd.md](./erd.md)
-- [scaling-plan.md](./scaling-plan.md)
-- [microservices-plan.md](./microservices-plan.md)
+- Invalid input returns 400 with the Zod error details.
+- Known errors (not found, duplicate, not enough stock) are thrown as `ApiError` and return the matching status code.
+- Anything unexpected is logged and returns a plain 500.

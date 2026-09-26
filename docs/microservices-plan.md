@@ -1,42 +1,42 @@
-# Microservices conversion plan
+# Moving to microservices
 
-The repo is a modular monolith. Folders map to possible service boundaries later. Split only when team size or isolation needs justify the ops cost.
+The app is currently one service with the code split into clear modules. That is the right choice at this size. Microservices add a lot of deployment and monitoring work, so I would only split once the team or the load actually needs it.
 
-## Modules today
+## Current modules
 
-| Module | Responsibility |
-|--------|----------------|
-| outlets | Outlet CRUD |
-| menu-items | HQ catalog |
-| outlet-menu | Assign items and outlet prices |
-| inventory | Per-outlet stock |
-| sales | Checkout, receipts, sale lines |
-| reports | Read-only aggregates |
+- `outlets`: outlet details
+- `menu-items`: the master menu
+- `outlet-menu`: which items each outlet sells and at what price
+- `inventory`: stock per outlet
+- `sales`: checkout and receipt numbers
+- `reports`: read-only totals
 
-## Possible services
+## How it could be split
 
-| Service | Owns | Notes |
-|---------|------|-------|
-| Outlet registry | outlets | Outlet identity |
-| Catalog | menu_items | HQ SKUs |
-| Outlet menu | outlet_menu_items | What sells where |
-| Inventory | inventories | Stock rows |
-| Sales / checkout | sales, sale_items, receipt_sequences | One consistency boundary |
-| Reporting | aggregates | Event-driven read models |
+| Service | Tables it owns |
+|---------|----------------|
+| Outlets | `outlets` |
+| Catalog | `menu_items` |
+| Outlet menu | `outlet_menu_items` |
+| Inventory | `inventories` |
+| Checkout | `sales`, `sale_items`, `receipt_sequences` |
+| Reporting | its own summary tables |
 
-## Integration
+Each table should have exactly one service that writes to it. Other services ask that service through its API or read a copy of the data. Two services should never write to the same table.
 
-- Sync HTTP for request/response paths that need an immediate answer.
-- Async outbox + broker for analytics (`SaleCompleted`, etc.).
+## How services would talk
 
-## Data ownership
+- Plain HTTP calls when a service needs an answer right away.
+- Events for things that can happen a little later. For example, checkout publishes a "sale completed" event and reporting updates its totals from it. To make this reliable, checkout saves the event in its own database in the same transaction as the sale (the outbox pattern), and a separate worker sends it to the message broker.
 
-One writer per table. No dual writes across services.
+## The tricky part
 
-Sales, receipt sequences, and inventory deduction share one transaction today. Splitting them means a checkout service or a saga with idempotency.
+Today one transaction creates the sale, reduces stock and takes the next receipt number. If checkout and inventory became separate services, that single transaction would no longer exist. You would need a saga instead: reserve stock, create the sale, and undo the reservation if the sale fails. That is much harder to get right.
 
-## Practical path
+So I would keep checkout, inventory and receipt numbers in one service.
 
-1. Stay monolith until load or team boundaries force a change.
-2. Reporting is often the first extract (read-only, event-driven).
-3. Keep checkout, inventory, and receipt sequencing together unless there is a strong reason to separate.
+## Suggested order
+
+1. Stay with one service for now.
+2. If something needs to move out first, make it reporting. It only reads data and can run on events.
+3. Only split checkout and inventory if there is a strong reason to.

@@ -1,43 +1,36 @@
 # Scaling plan
 
-Rough planning notes for about 10 outlets and on the order of 100k sales per month. Not an SLA.
-
-## Assumptions
-
-- Shared PostgreSQL (e.g. Neon), one API deployment to start.
-- Reads dominate catalog and reports; writes spike at checkout.
-- Receipt numbers and stock stay strongly consistent per outlet.
+The current setup is fine for a few outlets. This page covers what I would change for around 10 outlets and about 100,000 sales a month, which works out to roughly 3,300 sales a day. These are rough planning numbers, not guarantees.
 
 ## Database
 
-- Use the provider pooler and cap app pool size.
-- Indexes already cover common filters; use `EXPLAIN ANALYZE` on slow reports before adding more.
-- Partition or archive old `sales` / `sale_items` when tables get large.
-- Heavy analytics can use a read replica or summary tables so checkout stays on OLTP.
+Postgres is where the pressure shows up first.
 
-## Reporting
+- Use the connection pooler from the hosting provider (Neon has one) and keep the app's pool small. Otherwise adding more API instances can use up all the database connections.
+- The columns we filter on most already have indexes (`outletId`, `menuItemId`, `sales.createdAt`). Before adding more, check slow queries with `EXPLAIN ANALYZE`.
+- `sales` and `sale_items` only ever grow. Once they get big, split them by month (Postgres partitioning) or move old data to an archive.
 
-- Pre-aggregate revenue and top sellers (materialized views or nightly jobs) instead of scanning full history on every request.
-- Always bound queries by time range and outlet.
+## Reports
+
+Right now the reports add up every sale each time they run. That gets slow as data grows. Two fixes:
+
+- Add a date range to the report endpoints so they don't scan the whole history.
+- Keep pre-calculated totals, for example a summary table updated every night or a materialized view.
+
+If reports get heavy, run them on a read replica so they don't slow down checkout.
 
 ## API
 
-- Stateless Node instances scale horizontally if the DB keeps up.
-- More replicas mean more concurrent writers; watch lock wait and connections on checkout.
-- Client idempotency keys for sale retries help on flaky networks.
+The API doesn't keep any state between requests, so you can run more copies behind a load balancer. Keep in mind that more copies means more sales competing for the same locks. Watch lock wait times before scaling up.
+
+It would also help to let the client send an idempotency key with each sale. If a request times out and the client retries, the server can return the first sale instead of creating a second one.
 
 ## Caching
 
-- Short TTL for stable reads (menu list, outlet directory).
-- Do not cache stock or checkout prices without a clear invalidation story.
+Things that rarely change, like the master menu and the outlet list, can be cached for a few minutes. Don't cache stock levels or prices used at checkout. Stale values there cause overselling or wrong totals.
 
 ## Operations
 
-- Log `outletId`, `saleId`, `receiptNumber` where useful.
-- Keep `GET /health` cheap.
-- Run migrations on deploy before traffic.
-
-## Related
-
-- [architecture.md](./architecture.md)
-- [erd.md](./erd.md)
+- Include `outletId`, `saleId` and `receiptNumber` in logs so problems are easy to trace.
+- Keep `/health` fast and cheap.
+- Run migrations during deploy, before new traffic reaches the new version.

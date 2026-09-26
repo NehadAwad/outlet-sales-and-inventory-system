@@ -1,40 +1,31 @@
-# Offline POS strategy
+# Offline POS
 
-Keep the register usable without network, then sync sales without duplicate receipts or silent stock errors. Server rules should match online checkout (`sale.service.ts`).
+The goal is to let an outlet keep selling when its internet drops, then send those sales to the server once it's back. When that happens there should be no duplicate sales and no wrong stock numbers.
 
-## Client storage
+## Saving sales on the device
 
-Local durable store (SQLite, IndexedDB) for:
+The POS app stores pending sales locally, for example in IndexedDB in the browser or SQLite in a desktop app. For each sale it keeps the items, quantities, time and sync status. It can also keep a copy of the outlet's menu and prices, so staff can still see them offline.
 
-- pending sale payloads and sync state,
-- optional catalog snapshot with a "as of" timestamp.
+## Avoiding duplicates
 
-## Idempotency
+Each offline sale gets an ID generated on the device. The server stores that ID with the sale it created. If the same sale is sent again, for example after a timeout, the server returns the existing sale instead of creating a new one.
 
-Each offline sale gets a client UUID (`Idempotency-Key` or body field). Server stores key, outletId, resulting `saleId`. Retries return the existing sale.
+## Syncing
 
-## Sync flow
-
-1. Upload pending sales when online (FIFO or priority).
-2. Server runs the same transaction as online: lock receipt sequence, validate assignment, lock inventory, decrement, insert sale lines.
-3. Client marks synced and stores `receiptNumber` / `saleId`.
-4. Retry 5xx with backoff.
-5. On 4xx (stock, assignment), mark failed locally and let staff fix the draft.
+1. When the connection comes back, the app sends pending sales one at a time, oldest first.
+2. The server handles each one exactly like an online sale: same transaction, same stock checks, same receipt numbering.
+3. On success, the app marks the sale as synced and saves the receipt number it got back.
+4. If the server fails (a 5xx error), the app waits and tries again.
+5. If the server rejects the sale (a 4xx error, for example not enough stock), the app stops retrying and shows it to staff to fix.
 
 ## Conflicts
 
-Stock can drop while offline. Show a clear message and require staff to adjust lines.
+The most likely problem is stock. While the device was offline, other sales may have used up the stock. The server will reject those sales and staff need to adjust or cancel them. Prices can also change while offline. The business needs to decide whether to accept the offline price or reject the sale.
 
-Price policy: snapshot offline or reject if live pricing is required.
+## Kitchen display
 
-## KDS
-
-Online: optional WebSocket for tickets. Offline POS may not reach KDS until reconnect; show staleness. Offline KDS is usually read-only or disabled.
+If the POS is offline, the kitchen display won't get new orders until it reconnects. It should show when it was last updated so staff know it may be out of date.
 
 ## Security
 
-Outlet-scoped device tokens, rate limits on sync, audit idempotency hits.
-
-## Summary
-
-Local queue + server idempotency + the same transactional checkout as online. Conflict UX is the hard part.
+Give each device its own token tied to its outlet. Rate limit the sync endpoint. Log duplicate and rejected sales so they can be checked later.
